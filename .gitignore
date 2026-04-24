@@ -1,0 +1,12 @@
+results/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+dist/
+build/
+*.json
+!results/.gitkeep
+CLAUDE.md
