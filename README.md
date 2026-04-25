@@ -60,7 +60,7 @@ llada/
 ## Setup
 
 ```bash
-pip install torch transformers accelerate datasets tqdm pandas matplotlib
+pip install -q "transformers>=4.38.0,<4.44.0" accelerate datasets evaluate tqdm pandas matplotlib
 ```
 
 Tested on Python 3.10+, A100 40 GB (Google Colab Pro). The model requires roughly 20 GB VRAM in bfloat16.
