@@ -2,8 +2,8 @@
 TALMAS: Timestep-Adaptive, Layer-Dependent Masked Attention Suppression.
 
 Implements the gate functions and hook manager described in the TALMAS proposal.
-The hook manager monkey-patches each attention layer's forward() to inject a
-logit bias before the softmax — no model weights are modified.
+The hook manager patches each LLaDALlamaBlock's forward() to inject a logit bias
+into attention_bias before the attention call — no model weights are modified.
 
 Suppression regime:
   Query \ Key  |  Real (m_j=0)  |  [MASK] (m_j=1)
@@ -68,8 +68,8 @@ def compute_lambda(
 
 class TALMASHookManager:
     """
-    Registers patched forward methods on each self-attention layer to inject
-    the TALMAS asymmetric logit bias before softmax.
+    Patches each LLaDALlamaBlock's forward() to inject the TALMAS asymmetric
+    logit bias into attention_bias before the attention call.
 
     Usage:
         manager = TALMASHookManager(model, cfg)
@@ -94,73 +94,62 @@ class TALMASHookManager:
     def _count_layers(self) -> int:
         if hasattr(self.model.config, "num_hidden_layers"):
             return self.model.config.num_hidden_layers
-        # Fallback: count self_attn modules
-        count = sum(1 for n, _ in self.model.named_modules() if n.endswith(".self_attn"))
+        # Fallback: count transformer blocks
+        count = sum(
+            1 for name, _ in self.model.named_modules()
+            if "transformer.blocks." in name and name.count(".") == 3
+        )
         return max(count, 1)
 
-    def _patch_attention(self, attn_module, layer_idx: int) -> None:
-        """Replace attn_module.forward so TALMAS bias is injected via F.sdpa."""
+    def _patch_attention(self, block_module, layer_idx: int) -> None:
+        """
+        Patch LLaDALlamaBlock.forward to inject TALMAS bias into attention_bias.
+        LLaDA passes attention_bias directly into self.attention(q, k, v, attention_bias),
+        so we intercept at the block level and add our logit bias there.
+        """
         manager = self
-        original_sdpa = F.scaled_dot_product_attention
-        original_forward = attn_module.forward
-
-        @functools.wraps(original_sdpa)
-        def patched_sdpa(query, key, value, attn_mask=None, **kw):
-            # Skip if hook not armed or bias is zero
-            if (
-                manager.mask_positions is None
-                or manager.cfg.lambda_max == 0.0
-            ):
-                return original_sdpa(query, key, value, attn_mask=attn_mask, **kw)
-
-            # Stale-state guard: mask_positions must match sequence length
-            seq_len = query.shape[-2]
-            if manager.mask_positions.shape[-1] != seq_len:
-                return original_sdpa(query, key, value, attn_mask=attn_mask, **kw)
-
-            lam = compute_lambda(
-                manager.cfg.lambda_max,
-                manager.r_t,
-                layer_idx,
-                manager.num_layers,
-                use_timestep_gate=manager.cfg.use_timestep_gate,
-                use_layer_gate=manager.cfg.use_layer_gate,
-                sigmoid_slope=manager.cfg.sigmoid_slope,
-                timestep_exponent=manager.cfg.timestep_exponent,
-            )
-
-            if lam == 0.0:
-                return original_sdpa(query, key, value, attn_mask=attn_mask, **kw)
-
-            # Build bias  (B, 1, S, S) — broadcasts over heads
-            m = manager.mask_positions.float().to(query.device)  # (B, S)
-            m_key   = m.unsqueeze(1).unsqueeze(2)   # (B, 1, 1, S)
-            m_query = m.unsqueeze(1).unsqueeze(3)   # (B, 1, S, 1)
-            query_gate = (1.0 - m_query) + manager.cfg.mu * m_query  # (B, 1, S, 1)
-            bias = -(lam * m_key * query_gate)       # (B, 1, S, S)
-
-            combined_mask = bias if attn_mask is None else attn_mask + bias
-            return original_sdpa(query, key, value, attn_mask=combined_mask, **kw)
-
-        # Store patch reference on the module so it isn't GC'd
-        attn_module._talmas_patched_sdpa = patched_sdpa
+        original_forward = block_module.forward
 
         @functools.wraps(original_forward)
-        def patched_forward(*args, **kwargs):
-            old = F.scaled_dot_product_attention
-            F.scaled_dot_product_attention = attn_module._talmas_patched_sdpa
-            try:
-                return original_forward(*args, **kwargs)
-            finally:
-                F.scaled_dot_product_attention = old
+        def patched_forward(x, attention_bias=None, **kwargs):
+            if manager.mask_positions is not None and manager.cfg.lambda_max > 0.0:
+                lam = compute_lambda(
+                    manager.cfg.lambda_max,
+                    manager.r_t,
+                    layer_idx,
+                    manager.num_layers,
+                    use_timestep_gate=manager.cfg.use_timestep_gate,
+                    use_layer_gate=manager.cfg.use_layer_gate,
+                    sigmoid_slope=manager.cfg.sigmoid_slope,
+                    timestep_exponent=manager.cfg.timestep_exponent,
+                )
 
-        attn_module.forward = patched_forward
-        self._patched.append((attn_module, original_forward))
+                if lam > 0.0:
+                    m = manager.mask_positions.float().to(x.device)  # (B, S)
+
+                    m_key   = m.unsqueeze(1).unsqueeze(2)   # (B, 1, 1, S)
+                    m_query = m.unsqueeze(1).unsqueeze(3)   # (B, 1, S, 1)
+                    query_gate = (1.0 - m_query) + manager.cfg.mu * m_query
+                    talmas_bias = -(lam * m_key * query_gate)       # (B, 1, S, S)
+
+                    # Match the dtype that _cast_attn_bias expects
+                    talmas_bias = talmas_bias.to(dtype=x.dtype)
+
+                    if attention_bias is not None:
+                        attention_bias = attention_bias + talmas_bias
+                    else:
+                        attention_bias = talmas_bias
+
+            return original_forward(x, attention_bias=attention_bias, **kwargs)
+
+        block_module.forward = patched_forward
+        self._patched.append((block_module, original_forward))
 
     def _register_patches(self) -> None:
+        """Patch each LLaDALlamaBlock — named model.transformer.blocks.N"""
         layer_idx = 0
         for name, module in self.model.named_modules():
-            if name.endswith(".self_attn"):
+            if "transformer.blocks." in name and name.count(".") == 3:
                 self._patch_attention(module, layer_idx)
                 layer_idx += 1
 
@@ -170,8 +159,8 @@ class TALMASHookManager:
         self.mask_positions = mask_positions
 
     def remove(self) -> None:
-        """Restore all original attention forward methods."""
-        for attn_module, original_forward in self._patched:
-            attn_module.forward = original_forward
+        """Restore all original block forward methods."""
+        for block_module, original_forward in self._patched:
+            block_module.forward = original_forward
         self._patched.clear()
         self.mask_positions = None

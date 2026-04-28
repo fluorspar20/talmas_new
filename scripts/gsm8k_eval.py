@@ -89,11 +89,23 @@ def evaluate(args) -> float:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # Force eager attention when TALMAS is enabled so the F.sdpa monkey-patch
-    # fires.  Flash Attention 2 bypasses F.scaled_dot_product_attention and
-    # would silently skip TALMAS without this flag.
+    # Force eager attention when TALMAS is enabled so the block-level patch
+    # fires correctly.  Flash Attention 2 bypasses the attention_bias path
+    # and would silently skip TALMAS without this flag.
     eager_attn = args.talmas
     tokenizer, model = load_model_and_tokenizer(args.model, eager_attn=eager_attn)
+
+    print(f"attn_implementation: {getattr(model.config, '_attn_implementation', 'unknown')}")
+
+    # Explicitly nullify flash_attn_func on every block so _scaled_dot_product_attention
+    # falls through to the F.sdpa path, which respects the attention_bias we inject.
+    if args.talmas:
+        disabled = 0
+        for name, module in model.named_modules():
+            if hasattr(module, "flash_attn_func"):
+                module.flash_attn_func = None
+                disabled += 1
+        print(f"Flash attention disabled in {disabled} blocks")
 
     mask_token_id, eos_token_id = resolve_special_tokens(tokenizer, model)
     print(f"mask_token_id={mask_token_id}, eos_token_id={eos_token_id}\n")
@@ -188,7 +200,7 @@ def evaluate(args) -> float:
             status = "✓" if is_correct else "✗"
             running_acc = correct / total * 100
             tqdm.write(
-                f"[{total:>4}] {status}  gold={gold_ans:<8}  pred={pred_ans:<8}  "
+                f"[{total:>4}] {status}  gold={str(gold_ans):<8}  pred={str(pred_ans):<8}  "
                 f"running acc: {correct}/{total} ({running_acc:.1f}%)"
             )
             if args.verbose:
