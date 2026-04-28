@@ -186,6 +186,11 @@ def main(args):
 
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # Eliminate CUDA non-determinism from parallel reductions.
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 

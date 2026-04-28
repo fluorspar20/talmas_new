@@ -86,14 +86,17 @@ def low_confidence_remasking_sample(
         current_response = input_ids[0, prompt_len:]  # (L,)
         already_unmasked  = (current_response != mask_token_id)
         confidence = confidence.masked_fill(already_unmasked, 1.0)
+        # TODO: Print confidence values for every token for every 10 denoising steps
         pred_ids   = torch.where(already_unmasked, current_response, pred_ids)
 
         # Number of tokens that should be unmasked at time s
         n_unmask = math.floor(L * (1.0 - s))
         n_unmask = max(0, min(n_unmask, L))
 
-        # Select the n_unmask positions with the highest confidence
-        _, top_indices = torch.topk(confidence, k=n_unmask, largest=True)
+        # Select the n_unmask positions with the highest confidence.
+        # stable=True breaks ties by input order, eliminating non-determinism
+        # from bfloat16 probability ties across runs.
+        _, top_indices = torch.topk(confidence, k=n_unmask, largest=True, stable=True)
         new_response = torch.full((L,), mask_token_id, dtype=torch.long, device=device)
         new_response[top_indices] = pred_ids[top_indices]
 

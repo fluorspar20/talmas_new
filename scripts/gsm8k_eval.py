@@ -84,27 +84,39 @@ def evaluate(args) -> float:
     print()
 
     # ------------------------------------------------------------------ #
+    # Determinism                                                          #
+    # ------------------------------------------------------------------ #
+    # Eliminates CUDA non-determinism from parallel reductions in matmul
+    # and softmax.  warn_only=True lets ops without a deterministic CUDA
+    # kernel fall back silently rather than hard-erroring (some LLaDA
+    # gather ops hit this).
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
+    # ------------------------------------------------------------------ #
     # Load model                                                           #
     # ------------------------------------------------------------------ #
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # Force eager attention when TALMAS is enabled so the block-level patch
-    # fires correctly.  Flash Attention 2 bypasses the attention_bias path
-    # and would silently skip TALMAS without this flag.
-    eager_attn = args.talmas
-    tokenizer, model = load_model_and_tokenizer(args.model, eager_attn=eager_attn)
+    # Always use eager attention so that:
+    #   1. The block-level TALMAS patch fires (Flash Attention 2 bypasses
+    #      the attention_bias path the hook injects into).
+    #   2. Baseline and TALMAS configs run the same attention kernel,
+    #      removing the implementation switch as a confound.
+    tokenizer, model = load_model_and_tokenizer(args.model, eager_attn=True)
 
     print(f"attn_implementation: {getattr(model.config, '_attn_implementation', 'unknown')}")
 
-    # Explicitly nullify flash_attn_func on every block so _scaled_dot_product_attention
-    # falls through to the F.sdpa path, which respects the attention_bias we inject.
-    if args.talmas:
-        disabled = 0
-        for name, module in model.named_modules():
-            if hasattr(module, "flash_attn_func"):
-                module.flash_attn_func = None
-                disabled += 1
+    # Nullify flash_attn_func on every block unconditionally — keeps baseline
+    # and TALMAS on the same code path.
+    disabled = 0
+    for name, module in model.named_modules():
+        if hasattr(module, "flash_attn_func"):
+            module.flash_attn_func = None
+            disabled += 1
+    if disabled:
         print(f"Flash attention disabled in {disabled} blocks")
 
     mask_token_id, eos_token_id = resolve_special_tokens(tokenizer, model)
