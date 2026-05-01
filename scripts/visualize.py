@@ -2,10 +2,10 @@
 TALMAS diagnostics visualization — runs one GSM8K example and saves plots.
 
 Outputs written to --output-dir:
-  attention.gif    — animated attention heatmap (last layer, every 10 steps)
-  suppression.gif  — animated suppression bias (last layer, every 10 steps) [TALMAS only]
-  confidence.png   — token confidence per position at every 50 steps
-  scalar.png       — mean attention-to-[MASK] over all denoising steps
+  attention.png    — grid of attention heatmaps (last layer, every 10 steps)
+  suppression.png  — grid of suppression bias heatmaps (last layer, every 10 steps) [TALMAS only]
+  confidence.png   — token confidence per position at every 10 steps
+  scalar.png       — mean attention-to-[MASK] over captured denoising steps
 
 Usage:
   # Baseline (no suppression):
@@ -20,10 +20,19 @@ Usage:
       --talmas --lambda-max 4.0 --mu 0.1 \\
       --output-dir results/viz_talmas
 
+  # Verify suppression numerically (prints before/after attention tables):
+  python scripts/visualize.py \\
+      --model GSAI-ML/LLaDA-8B-Instruct \\
+      --index 0 --steps 64 \\
+      --talmas --lambda-max 4.0 --mu 0.1 \\
+      --log-suppression --output-dir results/viz_talmas
+
 Run both and compare scalar.png to see whether suppression is reducing
-attention to [MASK] tokens.
+attention to [MASK] tokens.  Add --log-suppression to print numerical
+before-vs-after tables at the first, middle, and last diffusion steps.
 """
 
+import dataclasses
 import sys
 import os
 import argparse
@@ -39,6 +48,7 @@ from src.utils import build_prompt, resolve_special_tokens, load_model_and_token
 from src.sampling import low_confidence_remasking_sample
 from src.talmas import TALMASHookManager
 from src.diagnostics import DiagnosticsCollector
+from src.suppression_log import SuppresssionLogger
 
 
 def main(args) -> None:
@@ -48,10 +58,13 @@ def main(args) -> None:
 
     is_instruct = "instruct" in args.model.lower()
     cfg = INSTRUCT_CONFIG if is_instruct else BASE_CONFIG
+    overrides = {}
     if args.steps:
-        cfg.steps = args.steps
+        overrides["steps"] = args.steps
     if args.generation_length:
-        cfg.generation_length = args.generation_length
+        overrides["generation_length"] = args.generation_length
+    if overrides:
+        cfg = dataclasses.replace(cfg, **overrides)
 
     talmas_cfg = None
     if args.talmas:
@@ -102,15 +115,28 @@ def main(args) -> None:
     print(f"Prompt: {prompt_len} tokens  |  Gen: {cfg.generation_length}  |  Steps: {cfg.steps}")
 
     # ------------------------------------------------------------------ #
-    # Install hooks                                                         #
+    # Install hooks  (order matters — each wraps the previous)            #
     # ------------------------------------------------------------------ #
     hook_manager = None
     if talmas_cfg is not None and talmas_cfg.lambda_max > 0.0:
-        hook_manager = TALMASHookManager(model, talmas_cfg)
+        hook_manager = TALMASHookManager(model, talmas_cfg)  # 1st
 
-    # DiagnosticsCollector must be installed AFTER TALMASHookManager so its
-    # capturing_fwd wraps the already-patched block forward.
-    diagnostics = DiagnosticsCollector(
+    # SuppresssionLogger sits between TALMAS and DiagnosticsCollector so
+    # the F.sdpa call chain for the last block is:
+    #   DiagnosticsCollector → SuppresssionLogger → real F.sdpa
+    # Both loggers see Q / K / attn_mask independently.
+    supp_logger = None
+    if args.log_suppression:
+        supp_logger = SuppresssionLogger(                             # 2nd
+            model,
+            total_steps=cfg.steps,
+            n_samples=args.log_samples,
+        )
+        print(f"SuppresssionLogger: active  (n_samples={args.log_samples} per type, "
+              f"steps 0 / {cfg.steps // 2} / {cfg.steps - 1})")
+
+    # DiagnosticsCollector is outermost so it wraps the already-patched forward.
+    diagnostics = DiagnosticsCollector(                               # 3rd
         model, talmas_cfg, num_layers,
         capture_attn_every=args.capture_attn_every,
         capture_conf_every=args.capture_conf_every,
@@ -131,12 +157,15 @@ def main(args) -> None:
             eos_token_id=eos_token_id,
             hook_manager=hook_manager,
             diagnostics=diagnostics,
+            supp_logger=supp_logger,
         )
     finally:
-        # Remove diagnostics first, then TALMAS — reverse install order
-        diagnostics.remove()
+        # Remove in reverse install order
+        diagnostics.remove()                     # 3rd installed, 1st removed
+        if supp_logger is not None:
+            supp_logger.remove()                 # 2nd installed, 2nd removed
         if hook_manager is not None:
-            hook_manager.remove()
+            hook_manager.remove()                # 1st installed, 3rd removed
 
     output_text = tokenizer.decode(output_ids, skip_special_tokens=True)
     print(f"\nGenerated:\n{output_text[:500]}")
@@ -174,6 +203,15 @@ def build_parser() -> argparse.ArgumentParser:
     talmas.add_argument("--mu", type=float, default=0.1)
     talmas.add_argument("--no-timestep-gate", action="store_true", dest="no_timestep_gate")
     talmas.add_argument("--no-layer-gate", action="store_true", dest="no_layer_gate")
+
+    log = p.add_argument_group("Suppression logging options")
+    log.add_argument("--log-suppression", action="store_true", dest="log_suppression",
+                     help="Print before-vs-after attention tables at first, middle, and "
+                          "last diffusion steps to verify suppression is active.  "
+                          "Works with or without --talmas (baseline shows Δ=0).")
+    log.add_argument("--log-samples", type=int, default=3, dest="log_samples",
+                     help="Token pairs to sample per interaction type in each table "
+                          "(real→real, real→[MASK], [MASK]→real, [MASK]→[MASK])")
 
     return p
 

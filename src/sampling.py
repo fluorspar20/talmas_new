@@ -4,6 +4,9 @@ LLaDA reverse-diffusion sampling  (Algorithm 5: low-confidence remasking).
 Extracted verbatim from llada_gsm8k_eval.py with one addition: an optional
 hook_manager parameter that updates TALMAS state before each forward pass.
 All Algorithm 5 logic is unchanged.
+
+Optional supp_logger (SuppresssionLogger) receives begin_step / log calls at
+three target steps to print before-vs-after attention weight tables.
 """
 
 import math
@@ -26,6 +29,7 @@ def low_confidence_remasking_sample(
     eos_token_id: int,
     hook_manager=None,                 # TALMASHookManager | None
     diagnostics=None,                  # DiagnosticsCollector | None
+    supp_logger=None,                  # SuppresssionLogger | None
 ) -> torch.Tensor:
     """
     Pure diffusion sampling with low-confidence remasking (Algorithm 5).
@@ -35,6 +39,10 @@ def low_confidence_remasking_sample(
 
     If diagnostics is provided, it receives begin_step / end_step calls each
     iteration so attention weights, confidence, and suppression can be captured.
+
+    If supp_logger is provided, it receives begin_step / log calls at three
+    target steps (first, middle, last) and prints before-vs-after attention
+    weight tables to verify suppression is active.
 
     Returns the generated token ids as a 1-D tensor (response only).
     """
@@ -59,7 +67,7 @@ def low_confidence_remasking_sample(
         # -------------------------------------------------------------- #
         # TALMAS + diagnostics: compute mask positions once, shared by both#
         # -------------------------------------------------------------- #
-        needs_mask = hook_manager is not None or diagnostics is not None
+        needs_mask = hook_manager is not None or diagnostics is not None or supp_logger is not None
         mask_positions = (input_ids == mask_token_id) if needs_mask else None  # (1, S)
 
         if hook_manager is not None:
@@ -67,6 +75,9 @@ def low_confidence_remasking_sample(
 
         if diagnostics is not None:
             diagnostics.begin_step(i, t_val, mask_positions)
+
+        if supp_logger is not None:
+            supp_logger.begin_step(i, mask_positions)
 
         # -------------------------------------------------------------- #
         # Step 2 — forward pass: predict all masked tokens simultaneously #
@@ -98,6 +109,9 @@ def low_confidence_remasking_sample(
 
         if diagnostics is not None:
             diagnostics.end_step(i, confidence)
+
+        if supp_logger is not None:
+            supp_logger.log(i, prompt_len)
 
         # Number of tokens that should be unmasked at time s
         n_unmask = math.floor(L * (1.0 - s))

@@ -384,7 +384,7 @@ def _plot_scalar(
     ax.set_xlabel("Denoising step")
     ax.set_ylabel("Mean attention weight")
     ax.set_title(
-        "Mean attention: real response tokens → [MASK] tokens  (last layer)\n"
+        "Mean attention: real response tokens → [MASK] tokens  (last layer, sampled steps)\n"
         "With suppression this should be lower than baseline at the same step"
     )
     ax.set_ylim(bottom=0)
