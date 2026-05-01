@@ -1,6 +1,6 @@
 """
-SuppresssionLogger: prints before-vs-after attention weight tables at three
-diffusion steps (first, middle, last) to verify TALMAS suppression is active.
+SuppresssionLogger: prints before-vs-after attention weight tables every N
+diffusion steps to verify TALMAS suppression is active.
 
 For each target step the last transformer layer's F.scaled_dot_product_attention
 call is intercepted.  We have access to Q, K, and `attn_mask` (the TALMAS
@@ -34,26 +34,26 @@ import torch.nn.functional as F
 
 class SuppresssionLogger:
     """
-    Logs attention weights before and after TALMAS suppression at three
-    diffusion steps: first (step 0), middle (step N//2), last (step N-1).
+    Logs attention weights before and after TALMAS suppression every
+    `log_every` diffusion steps.
 
     For each target step a table is printed with sampled token pairs from all
     four interaction types: real→real, real→[MASK], [MASK]→real, [MASK]→[MASK].
     """
 
-    def __init__(self, model, total_steps: int, n_samples: int = 3):
+    def __init__(self, model, total_steps: int, n_samples: int = 3, log_every: int = 10):
         """
         Args:
             model:       LLaDA model (already passed through TALMASHookManager).
             total_steps: Total number of diffusion steps N.
             n_samples:   Pairs to sample per interaction type (default 3).
+            log_every:   Print a table every this many steps (default 10).
         """
         self.total_steps = total_steps
         self.n_samples = n_samples
+        self.log_every = log_every
 
-        mid = total_steps // 2
-        self._target_steps = {0, mid, total_steps - 1}
-        self._step_labels = {0: "first", mid: "middle", total_steps - 1: "last"}
+        self._target_steps = set(range(0, total_steps, log_every))
 
         self._last_block = None
         self._orig_fwd = None
@@ -171,10 +171,9 @@ class SuppresssionLogger:
         rng = np.random.default_rng(42)
         pairs = _sample_pairs(real_idx, mask_idx, self.n_samples, rng)
 
-        label = self._step_labels.get(step_idx, str(step_idx))
         _print_table(
             step_idx=step_idx,
-            step_label=label,
+            total_steps=self.total_steps,
             L=len(mr),
             n_masked=int(mr.sum()),
             before=br,
@@ -217,7 +216,7 @@ def _sample_pairs(
 
 def _print_table(
     step_idx: int,
-    step_label: str,
+    total_steps: int,
     L: int,
     n_masked: int,
     before: np.ndarray,
@@ -227,7 +226,7 @@ def _print_table(
     W = 78
     print(f"\n{'═' * W}")
     print(
-        f"  Suppression check — step {step_idx} ({step_label})"
+        f"  Suppression check — step {step_idx}/{total_steps - 1}"
         f"  |  {n_masked}/{L} response tokens masked"
         f"  |  last layer, mean over heads"
     )

@@ -131,9 +131,10 @@ def main(args) -> None:
             model,
             total_steps=cfg.steps,
             n_samples=args.log_samples,
+            log_every=args.log_every,
         )
-        print(f"SuppresssionLogger: active  (n_samples={args.log_samples} per type, "
-              f"steps 0 / {cfg.steps // 2} / {cfg.steps - 1})")
+        print(f"SuppresssionLogger: active  (every {args.log_every} steps, "
+              f"n_samples={args.log_samples} per type)")
 
     # DiagnosticsCollector is outermost so it wraps the already-patched forward.
     diagnostics = DiagnosticsCollector(                               # 3rd
@@ -206,9 +207,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     log = p.add_argument_group("Suppression logging options")
     log.add_argument("--log-suppression", action="store_true", dest="log_suppression",
-                     help="Print before-vs-after attention tables at first, middle, and "
-                          "last diffusion steps to verify suppression is active.  "
+                     help="Print before-vs-after attention tables every --log-every steps "
+                          "to verify suppression is active.  "
                           "Works with or without --talmas (baseline shows Δ=0).")
+    log.add_argument("--log-every", type=int, default=10, dest="log_every",
+                     help="Print a suppression table every N diffusion steps")
     log.add_argument("--log-samples", type=int, default=3, dest="log_samples",
                      help="Token pairs to sample per interaction type in each table "
                           "(real→real, real→[MASK], [MASK]→real, [MASK]→[MASK])")
