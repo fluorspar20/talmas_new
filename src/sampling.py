@@ -108,7 +108,7 @@ def low_confidence_remasking_sample(
         pred_ids   = torch.where(already_unmasked, current_response, pred_ids)
 
         if diagnostics is not None:
-            diagnostics.end_step(i, confidence)
+            diagnostics.end_step(i, confidence, pred_ids)
 
         if supp_logger is not None:
             supp_logger.log(i, prompt_len)
